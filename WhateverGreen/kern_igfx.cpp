@@ -55,13 +55,17 @@ IGFX *IGFX::callbackIGFX;
 
 void IGFX::init() {
 	callbackIGFX = this;
-
+	hasReadEdidINfo = false;
 	int canLoadGuC = 0;
 	if (getKernelVersion() >= KernelVersion::HighSierra)
 		PE_parse_boot_argn("igfxfw", &canLoadGuC, sizeof(canLoadGuC));
 
 	uint32_t family = 0, model = 0;
 	cpuGeneration = CPUInfo::getGeneration(&family, &model);
+	
+	SYSLOG("igfx", "found an  processor 0x%X:0x%X ", family, model);
+
+	
 	switch (cpuGeneration) {
 		case CPUInfo::CpuGeneration::Penryn:
 		case CPUInfo::CpuGeneration::Nehalem:
@@ -107,6 +111,8 @@ void IGFX::init() {
 			currentFramebuffer = &kextIntelCFLFb;
 			// Allow faking ask KBL
 			currentFramebufferOpt = &kextIntelKBLFb;
+			SYSLOG("igfx", "CPUInfo::CpuGeneration::CoffeeLake");
+			
 			// Note, several CFL GPUs are completely broken. They freeze in IGMemoryManager::initCache due to incompatible
 			// configuration, supposedly due to Apple not supporting new MOCS table and forcing Skylake-based format.
 			// See: https://github.com/torvalds/linux/blob/135c5504a600ff9b06e321694fbcac78a9530cd4/drivers/gpu/drm/i915/intel_mocs.c#L181
@@ -148,6 +154,8 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	bool switchOffFramebuffer = false;
 	framebufferPatch.framebufferId = info->reportedFramebufferId;
 
+	DBGLOG("igfx", "processKernel" );
+	
 	if (info->videoBuiltin) {
 		applyFramebufferPatch = loadPatchesFromDevice(info->videoBuiltin, info->reportedFramebufferId);
 
@@ -161,7 +169,8 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 
 		bool connectorLessFrame = info->reportedFramebufferIsConnectorLess;
 
-		// Black screen (ComputeLaneCount) happened from 10.12.4
+		// Black screen (ComputeLaneCount) happened from 10.12.4上边是Dany的提案。
+
 		// It only affects SKL, KBL, and CFL drivers with a frame with connectors.
 		if (!connectorLessFrame && cpuGeneration >= CPUInfo::CpuGeneration::Skylake &&
 			((getKernelVersion() == KernelVersion::Sierra && getKernelMinorVersion() >= 5) || getKernelVersion() >= KernelVersion::HighSierra)) {
@@ -187,6 +196,7 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 		switchOffGraphics = !pavpDisablePatch && !forceOpenGL && !moderniseAccelerator && !avoidFirmwareLoading;
 	} else {
 		switchOffGraphics = switchOffFramebuffer = true;
+		SYSLOG("igfx", "not info->videoBuiltin" );
 	}
 
 	if (switchOffGraphics && currentGraphics)
@@ -203,6 +213,81 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 		KernelPatcher::RouteRequest request("__ZN9IOService20copyExistingServicesEP12OSDictionaryjj", wrapCopyExistingServices, orgCopyExistingServices);
 		patcher.routeMultiple(KernelPatcher::KernelID, &request, 1);
 	}
+}
+
+
+int IGFX::WrappCheckForEDIDOverride(IOService *that, 	unsigned int x, unsigned char* buff)
+{
+	
+	int fbindex = *(int *)((char*)that +0x1dc);
+	
+	DBGLOG("igfx", "WrappCheckForEDIDOverride called for fb%d %p  !", fbindex, that);
+	
+	int ret=0;
+	
+
+	if(callbackIGFX->OrgCheckForEDIDOverride)
+	{
+		ret =  FunctionCast(WrappCheckForEDIDOverride, callbackIGFX->OrgCheckForEDIDOverride) (that,x, buff);
+	}
+	
+	if(!callbackIGFX->hasReadEdidINfo)
+	{
+		callbackIGFX->framebufferPatchFlags.bits.EdidOverride  = 0;
+		IOService *igpu = that->getProvider();
+		if(igpu)
+		{
+			auto ediddata = OSDynamicCast(OSData, igpu->getProperty("edid-override"));
+			uint8_t hasEdidIndex = WIOKit::getOSDataValue<uint32_t>(igpu, "edid-override-index",
+																	callbackIGFX->framebufferPatch.edidOverrideIndex);
+			
+			if(ediddata && hasEdidIndex  )
+			{
+				if(ediddata->getLength()==128)
+				{
+					callbackIGFX->framebufferPatchFlags.bits.EdidOverride =1;
+					uint8_t *pd =   (uint8_t *)ediddata->getBytesNoCopy();
+					
+					for(int i=0;i<128;i++)
+					{
+						callbackIGFX->framebufferPatch.edidOverride[i] = pd[i];
+					}
+					
+					DBGLOG("igfx", "READ THE CONFIG OF EDID OVERRIDED");
+				}
+				else
+				{
+					SYSLOG("igfx", "ediddata->getLength(%d) =!128", ediddata->getLength());
+				}
+			}
+			
+			callbackIGFX->hasReadEdidINfo = true;
+		}
+	}
+	
+	
+	if(callbackIGFX->framebufferPatchFlags.bits.EdidOverride)
+	{
+		if(fbindex==callbackIGFX->framebufferPatch.edidOverrideIndex)
+		{
+
+			for(int i=0;i<128;i++)
+			{
+				buff[i] = callbackIGFX->framebufferPatch.edidOverride[i];
+			}
+			
+			SYSLOG("igfx", "WrappCheckForEDIDOverride applied for fb%d !", fbindex );
+
+			return 0;
+		}
+	}
+	else
+	{
+		SYSLOG("igfx", "setting for edid not set !" );
+	}
+	
+	
+	return ret;
 }
 
 bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -248,8 +333,16 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 				KernelPatcher::RouteRequest request("__ZN31AppleIntelFramebufferController16ComputeLaneCountEPK29IODetailedTimingInformationV2jjPj", wrapComputeLaneCount, orgComputeLaneCount);
 				patcher.routeMultiple(index, &request, 1, address, size);
 			}
+			
+			
 		}
 
+		if(true)
+		{
+			KernelPatcher::RouteRequest request("__ZN21AppleIntelFramebuffer20checkForEDIDOverrideEjPh", WrappCheckForEDIDOverride, OrgCheckForEDIDOverride);
+			patcher.routeMultiple(index, &request, 1, address, size);
+		}
+		
 		if (applyFramebufferPatch || dumpFramebufferToDisk || dumpPlatformTable || hdmiAutopatch) {
 			if (cpuGeneration == CPUInfo::CpuGeneration::SandyBridge) {
 				gPlatformListIsSNB = true;
@@ -324,6 +417,8 @@ bool IGFX::wrapComputeLaneCount(void *that, void *timing, uint32_t bpp, int32_t 
 }
 
 bool IGFX::wrapComputeLaneCountNouveau(void *that, void *timing, int32_t availableLanes, int32_t *laneCount) {
+		DBGLOG("igfx", "wrapComputeLaneCountNouveau called");
+	
 	bool r = FunctionCast(wrapComputeLaneCountNouveau, callbackIGFX->orgComputeLaneCount)(that, timing, availableLanes, laneCount);
 	if (!r && *laneCount == 0) {
 		DBGLOG("igfx", "reporting worked lane count (nouveau)");
@@ -637,7 +732,7 @@ bool IGFX::loadPatchesFromDevice(IORegistryEntry *igpu, uint32_t currentFramebuf
 		framebufferPatchFlags.bits.FPFFramebufferMemorySize = WIOKit::getOSDataValue(igpu, "framebuffer-fbmem", framebufferPatch.fFramebufferMemorySize);
 		framebufferPatchFlags.bits.FPFUnifiedMemorySize = WIOKit::getOSDataValue(igpu, "framebuffer-unifiedmem", framebufferPatch.fUnifiedMemorySize);
 		framebufferPatchFlags.bits.FPFFramebufferCursorSize = WIOKit::getOSDataValue(igpu, "framebuffer-cursormem", fPatchCursorMemorySize);
-
+		
 		if (framebufferPatchFlags.value != 0)
 			hasFramebufferPatch = true;
 
@@ -995,9 +1090,9 @@ void IGFX::applyFramebufferPatches() {
 		}
 
 		if (success)
-			DBGLOG("igfx", "Patching framebufferId 0x%08X successful", framebufferId);
+			DBGLOG("igfx", "applyFramebufferPatches Patching framebufferId 0x%08X successful", framebufferId);
 		else
-			DBGLOG("igfx", "Patching framebufferId 0x%08X failed", framebufferId);
+			DBGLOG("igfx", "applyFramebufferPatches Patching framebufferId 0x%08X failed", framebufferId);
 	}
 
 	uint8_t *platformInformationAddress = findFramebufferId(framebufferId, static_cast<uint8_t *>(gPlatformInformationList), PAGE_SIZE);
@@ -1069,7 +1164,7 @@ void IGFX::applyHdmiAutopatch() {
 	}
 	
 	if (success)
-		DBGLOG("igfx", "Patching framebufferId 0x%08X successful", framebufferId);
+		DBGLOG("igfx", "applyHdmiAutopatch Patching framebufferId 0x%08X successful", framebufferId);
 	else
-		DBGLOG("igfx", "Patching framebufferId 0x%08X failed", framebufferId);
+		DBGLOG("igfx", "applyHdmiAutopatch Patching framebufferId 0x%08X failed", framebufferId);
 }

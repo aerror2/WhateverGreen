@@ -69,6 +69,7 @@ private:
 			uint8_t FPFBTTArrayHDMIAddr         :1;
 			uint8_t FPFSliceCount               :1;
 			uint8_t FPFEuCount                  :1;
+			uint8_t EdidOverride                :1;
 		} bits;
 		uint32_t value;
 	};
@@ -207,6 +208,10 @@ private:
 	 *  Original IGMappedBuffer::getGPUVirtualAddress function
 	 */
 	mach_vm_address_t orgIgBufferGetGpuVirtualAddress {};
+	
+	
+	mach_vm_address_t OrgCheckForEDIDOverride{};
+	
 
 	/**
 	 *  Detected CPU generation of the host system
@@ -380,6 +385,9 @@ private:
 	 *  IGMappedBuffer::getGPUVirtualAddress wrapper to trick GuC firmware virtual addresses
 	 */
 	static uint64_t wrapIgBufferGetGpuVirtualAddress(void *that);
+	
+
+	static int WrappCheckForEDIDOverride(IOService *that, 	unsigned int, unsigned char*);
 
 	/**
 	 *  Load GuC-specific patches and hooks
@@ -481,6 +489,8 @@ private:
 	 *  Apply DP to HDMI automatic connector type changes
 	 */
 	void applyHdmiAutopatch();
+	
+	bool hasReadEdidINfo;
 };
 
 #endif /* kern_igfx_hpp */
